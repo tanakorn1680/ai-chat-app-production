@@ -1,0 +1,14 @@
+{
+  "name": "ai-chat-app",
+  "version": "1.0.0",
+  "description": "A streaming AI chat UI (Thai-language, dark theme) with file/image attachments, backed by a Vercel serverless function that proxies OpenRouter.",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'Static site — nothing to build'",
+    "start": "vercel dev"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
