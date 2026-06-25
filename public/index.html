@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>AI Chat</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header>
+    <div class="h-left">
+      <div class="dot"></div>
+      <span class="model-name">North Mini Code</span>
+      <span class="badge">FREE</span>
+    </div>
+    <button class="clear-btn" onclick="clearChat()">ล้างแชท</button>
+  </header>
+
+  <!-- Messages -->
+  <div id="msgs">
+    <div id="empty">
+      <div class="empty-icon">✦</div>
+      <div class="empty-label">เริ่มสนทนาได้เลย</div>
+    </div>
+  </div>
+
+  <!-- Lightbox for full-size images -->
+  <div id="lightbox" onclick="closeLightbox()">
+    <img id="lb-img" src="" alt="">
+  </div>
+
+  <!-- Input -->
+  <div id="bottom">
+    <!-- Attachment previews row -->
+    <div id="previews"></div>
+
+    <!-- Input row -->
+    <div class="input-wrap alone" id="input-wrap">
+      <!-- Attach button -->
+      <button id="attach-btn" onclick="document.getElementById('file-in').click()" title="แนบไฟล์ / รูปภาพ">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19
+                   a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+        </svg>
+      </button>
+
+      <textarea id="ti" placeholder="พิมพ์ข้อความ…" rows="1"
+        oninput="onInput(this)" onkeydown="onKey(event)"></textarea>
+
+      <button id="send" onclick="send()" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+    <div class="hint">Enter ส่ง &nbsp;·&nbsp; Shift+Enter ขึ้นบรรทัดใหม่ &nbsp;·&nbsp; 📎 แนบไฟล์/รูป</div>
+  </div>
+
+  <!-- Hidden file input -->
+  <input type="file" id="file-in" multiple
+    accept="image/jpeg,image/png,image/gif,image/webp,image/svg+xml,
+            text/plain,.txt,.md,.lua,.js,.ts,.jsx,.tsx,.py,.html,.css,
+            .json,.csv,.xml,.yaml,.yml,.sh,.sql,.php,.rb,.go,.rs,.c,.cpp,.h"
+    onchange="onFileSelect(event)">
+</div>
+
+<script>
+  /* ── Config ──
+     No API key here. The browser only ever talks to our own
+     serverless function at /api/chat, which holds the real
+     OpenRouter key server-side (see api/chat.js + .env). */
+  const MODEL   = 'cohere/north-mini-code:free';
+  const ENDPOINT = '/api/chat';
+
+  /* ── State ── */
+  let history     = [];
+  let busy        = false;
+  let attachments = []; // { name, kind:'image'|'text', mimeType, data, size }
+
+  const msgsEl    = document.getElementById('msgs');
+  const emptyEl   = document.getElementById('empty');
+  const tiEl      = document.getElementById('ti');
+  const sendBtn   = document.getElementById('send');
+  const previewEl = document.getElementById('previews');
+  const wrapEl    = document.getElementById('input-wrap');
+
+  /* ── Helpers ── */
+  function esc(s) {
+    return String(s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function fmtSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
+    return (bytes/1048576).toFixed(1) + ' MB';
+  }
+
+  function fileIcon(name) {
+    const ext = name.split('.').pop().toLowerCase();
+    const map = {
+      js:'🟨', ts:'🔷', jsx:'🔵', tsx:'🔵',
+      py:'🐍', lua:'🌙', html:'🌐', css:'🎨',
+      json:'📋', csv:'📊', md:'📝', txt:'📄',
+      sh:'⚙️', xml:'📰', yaml:'⚙️', yml:'⚙️',
+      sql:'🗄️', c:'🔧', cpp:'🔧', h:'🔧',
+      go:'🐹', rs:'🦀', php:'🐘', rb:'💎',
+    };
+    return map[ext] || '📄';
+  }
+
+  /* ── File reading ── */
+  function readBase64(file) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload  = () => res(r.result);
+      r.onerror = rej;
+      r.readAsDataURL(file);
+    });
+  }
+
+  function readText(file) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload  = () => res(r.result);
+      r.onerror = rej;
+      r.readAsText(file);
+    });
+  }
+
+  /* ── File select handler ── */
+  async function onFileSelect(e) {
+    const files = Array.from(e.target.files);
+    e.target.value = '';
+
+    for (const file of files) {
+      const isImg = file.type.startsWith('image/');
+      if (isImg) {
+        const data = await readBase64(file);
+        attachments.push({ name: file.name, kind: 'image', mimeType: file.type,
+                           data, size: file.size });
+      } else {
+        const data = await readText(file);
+        attachments.push({ name: file.name, kind: 'text', mimeType: file.type || 'text/plain',
+                           data, size: file.size });
+      }
+    }
+    renderPreviews();
+    updateSend();
+  }
+
+  /* ── Render preview chips ── */
+  function renderPreviews() {
+    if (!attachments.length) {
+      previewEl.classList.remove('has-items');
+      previewEl.innerHTML = '';
+      wrapEl.className = 'input-wrap alone';
+      return;
+    }
+    previewEl.classList.add('has-items');
+    wrapEl.className = 'input-wrap with-previews';
+
+    previewEl.innerHTML = attachments.map((a, i) => {
+      if (a.kind === 'image') {
+        return `
+          <div class="pv-chip img">
+            <img src="${a.data}" alt="${esc(a.name)}" title="${esc(a.name)}">
+            <button class="pv-rm" onclick="removeAtt(${i})" title="ลบ">×</button>
+          </div>`;
+      } else {
+        const ext = (a.name.split('.').pop() || 'FILE').toUpperCase().slice(0,6);
+        const icon = fileIcon(a.name);
+        return `
+          <div class="pv-chip file">
+            <span style="font-size:16px;flex-shrink:0">${icon}</span>
+            <div style="display:flex;flex-direction:column;overflow:hidden;gap:1px">
+              <span class="pv-name">${esc(a.name)}</span>
+              <span style="font-size:10px;color:var(--muted)">${fmtSize(a.size)}</span>
+            </div>
+            <button class="pv-rm" onclick="removeAtt(${i})" title="ลบ">×</button>
+          </div>`;
+      }
+    }).join('');
+  }
+
+  function removeAtt(i) {
+    attachments.splice(i, 1);
+    renderPreviews();
+    updateSend();
+  }
+
+  function updateSend() {
+    sendBtn.disabled = busy || (!tiEl.value.trim() && !attachments.length);
+  }
+
+  /* ── Input helpers ── */
+  function onInput(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+    updateSend();
+  }
+
+  function onKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!sendBtn.disabled) send();
+    }
+  }
+
+  /* ── Markdown mini-parser ── */
+  function md(raw) {
+    const blocks = [];
+    let s = raw.replace(/```[\s\S]*?```/g, m => {
+      const code = m.replace(/```\w*\n?/, '').replace(/```$/, '').trim();
+      blocks.push(`<pre><code>${esc(code)}</code></pre>`);
+      return `\x00${blocks.length - 1}\x00`;
+    });
+    s = s.replace(/`([^`]+)`/g, (_, c) => `<code>${esc(c)}</code>`);
+    s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    s = s.replace(/^## (.+)$/gm,  '<h2>$1</h2>');
+    s = s.replace(/^# (.+)$/gm,   '<h1>$1</h1>');
+    s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\*\*(.+?)\*\*/g,     '<strong>$1</strong>');
+    s = s.replace(/\*(.+?)\*/g,         '<em>$1</em>');
+    s = s.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
+    s = s.replace(/^\d+\. (.+)$/gm,  '<li>$1</li>');
+    s = s.split(/\n{2,}/).map(p => {
+      p = p.trim();
+      if (!p) return '';
+      if (/^<(h\d|ul|ol|pre|li)/.test(p)) return p;
+      return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+    }).join('');
+    s = s.replace(/\x00(\d+)\x00/g, (_, i) => blocks[+i]);
+    return s;
+  }
+
+  /* ── Time ── */
+  function now() {
+    return new Date().toLocaleTimeString('th-TH', { hour:'2-digit', minute:'2-digit' });
+  }
+
+  /* ── Lightbox ── */
+  function openLightbox(src) {
+    document.getElementById('lb-img').src = src;
+    document.getElementById('lightbox').classList.add('open');
+  }
+  function closeLightbox() {
+    document.getElementById('lightbox').classList.remove('open');
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+  /* ── Build user bubble HTML (with attachments) ── */
+  function buildUserHtml(text, atts) {
+    let html = '';
+    if (atts.length) {
+      html += '<div class="att-row">';
+      for (const a of atts) {
+        if (a.kind === 'image') {
+          html += `
+            <div class="att-img-wrap" onclick="openLightbox(this.querySelector('img').src)" title="คลิกดูขนาดเต็ม">
+              <img src="${a.data}" alt="${esc(a.name)}">
+            </div>`;
+        } else {
+          const icon = fileIcon(a.name);
+          html += `
+            <div class="att-file-chip">
+              <span class="att-file-icon">${icon}</span>
+              <div class="att-file-info">
+                <span class="att-file-name" title="${esc(a.name)}">${esc(a.name)}</span>
+                <span class="att-file-size">${fmtSize(a.size)}</span>
+              </div>
+            </div>`;
+        }
+      }
+      html += '</div>';
+    }
+    if (text) html += md(esc(text));
+    return html;
+  }
+
+  /* ── Append message ── */
+  function appendMsg(role, html, streaming = false) {
+    emptyEl.style.display = 'none';
+    const el = document.createElement('div');
+    el.className = `msg ${role === 'user' ? 'user' : 'ai'}`;
+    el.innerHTML = `
+      <div class="msg-who">${role === 'user' ? 'คุณ' : 'AI'}</div>
+      <div class="bubble">${streaming
+        ? '<div class="dots"><span></span><span></span><span></span></div>'
+        : html}</div>
+    `;
+    msgsEl.appendChild(el);
+    scrollBot();
+    return el;
+  }
+
+  function fillBubble(el, html, done = false) {
+    el.querySelector('.bubble').innerHTML = html;
+    if (done) {
+      const t = document.createElement('div');
+      t.className = 'msg-time'; t.textContent = now();
+      el.appendChild(t);
+    }
+    scrollBot();
+  }
+
+  function scrollBot() { msgsEl.scrollTop = msgsEl.scrollHeight; }
+
+  /* ── Clear chat ── */
+  function clearChat() {
+    history = []; attachments = [];
+    renderPreviews();
+    msgsEl.innerHTML = '';
+    msgsEl.appendChild(emptyEl);
+    emptyEl.style.display = '';
+    updateSend();
+  }
+
+  /* ── Send ── */
+  async function send() {
+    const text = tiEl.value.trim();
+    if ((!text && !attachments.length) || busy) return;
+
+    const atts = [...attachments];
+
+    /* Build API content */
+    let userContent;
+    if (!atts.length) {
+      userContent = text;
+    } else {
+      const parts = [];
+      // Images → image_url parts
+      for (const a of atts) {
+        if (a.kind === 'image') {
+          parts.push({ type: 'image_url', image_url: { url: a.data } });
+        }
+      }
+      // Text files → prepend as text block
+      const fileTexts = atts
+        .filter(a => a.kind === 'text')
+        .map(a => `📄 **${a.name}**\n\`\`\`\n${a.data.slice(0, 8000)}\n\`\`\``)
+        .join('\n\n');
+      const combined = [fileTexts, text].filter(Boolean).join('\n\n');
+      if (combined) parts.push({ type: 'text', text: combined });
+      userContent = parts;
+    }
+
+    history.push({ role: 'user', content: userContent });
+
+    /* Show user bubble */
+    appendMsg('user', buildUserHtml(text, atts));
+    const t = document.createElement('div');
+    t.className = 'msg-time'; t.textContent = now();
+    msgsEl.lastElementChild.appendChild(t);
+
+    /* Reset input */
+    tiEl.value = ''; tiEl.style.height = 'auto';
+    attachments = []; renderPreviews();
+    busy = true; sendBtn.disabled = true;
+
+    /* AI typing */
+    const aiEl = appendMsg('assistant', '', true);
+    let full = '';
+
+    try {
+      const res = await fetch(ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: MODEL, messages: history })
+      });
+
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e?.error?.message || `HTTP ${res.status}`);
+      }
+
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') continue;
+          try {
+            const delta = JSON.parse(raw)?.choices?.[0]?.delta?.content;
+            if (delta) { full += delta; fillBubble(aiEl, md(full)); }
+          } catch {}
+        }
+      }
+
+      fillBubble(aiEl, md(full), true);
+      history.push({ role: 'assistant', content: full });
+
+    } catch (err) {
+      fillBubble(aiEl, `<div class="err-bubble">⚠ ${esc(err.message)}</div>`, true);
+      history.pop();
+    }
+
+    busy = false;
+    updateSend();
+    tiEl.focus();
+  }
+
+  tiEl.focus();
+</script>
+</body>
+</html>
