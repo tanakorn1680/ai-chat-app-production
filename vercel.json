@@ -3,9 +3,8 @@
   "buildCommand": null,
   "outputDirectory": "public",
   "functions": {
-    "api/chat.js": {
-      "maxDuration": 30
-    }
+    "api/chat.js":   { "maxDuration": 60 },
+    "api/models.js": { "maxDuration": 15 }
   },
   "rewrites": [
     { "source": "/api/chat", "destination": "/api/chat" }

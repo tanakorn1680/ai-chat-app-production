@@ -11,11 +11,12 @@
 
   <!-- Header -->
   <header>
-    <div class="h-left">
+    <button class="h-left" id="model-btn" onclick="openPicker()" title="เลือกโมเดล">
       <div class="dot"></div>
-      <span class="model-name">North Mini Code</span>
-      <span class="badge">FREE</span>
-    </div>
+      <span class="model-name" id="model-name">กำลังโหลด…</span>
+      <span class="badge" id="model-badge">FREE</span>
+      <span class="chev">▾</span>
+    </button>
     <button class="clear-btn" onclick="clearChat()">ล้างแชท</button>
   </header>
 
@@ -31,6 +32,20 @@
   <div id="lightbox" onclick="closeLightbox()">
     <img id="lb-img" src="" alt="">
   </div>
+
+  <!-- Model picker -->
+  <div id="picker" onclick="if(event.target===this)closePicker()">
+    <div class="sheet">
+      <div class="sheet-head">
+        <input id="pk-q" type="search" placeholder="ค้นหาโมเดล…" autocomplete="off" oninput="renderPicker()">
+        <button class="sheet-x" onclick="closePicker()" title="ปิด">×</button>
+      </div>
+      <div id="pk-chips"></div>
+      <div id="pk-list"></div>
+      <div id="pk-note"></div>
+    </div>
+  </div>
+  <div id="toast"></div>
 
   <!-- Input -->
   <div id="bottom">
@@ -51,12 +66,13 @@
       <textarea id="ti" placeholder="พิมพ์ข้อความ…" rows="1"
         oninput="onInput(this)" onkeydown="onKey(event)"></textarea>
 
-      <button id="send" onclick="send()" disabled>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      <button id="send" onclick="onSendClick()" disabled title="ส่ง">
+        <svg class="ic-send" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="22" y1="2" x2="11" y2="13"/>
           <polygon points="22 2 15 22 11 13 2 9 22 2"/>
         </svg>
+        <svg class="ic-stop" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
       </button>
     </div>
     <div class="hint">Enter ส่ง &nbsp;·&nbsp; Shift+Enter ขึ้นบรรทัดใหม่ &nbsp;·&nbsp; 📎 แนบไฟล์/รูป</div>
@@ -72,16 +88,35 @@
 
 <script>
   /* ── Config ──
-     No API key here. The browser only ever talks to our own
-     serverless function at /api/chat, which holds the real
-     OpenRouter key server-side (see api/chat.js + .env). */
-  const MODEL   = 'cohere/north-mini-code:free';
-  const ENDPOINT = '/api/chat';
+     No API keys here. The browser only talks to our own serverless
+     functions (/api/chat, /api/models); provider keys live server-side. */
+  const ENDPOINT   = '/api/chat';
+  const DEFAULT_ID = 'openrouter:cohere/north-mini-code:free';
+
+  const MAX_FILE_CHARS    = 20000;    // per text file sent to the model
+  const MAX_ATTACHMENTS   = 6;
+  const MAX_IMG_SIDE      = 1280;     // px — images are downscaled before sending
+  const KEEP_IMAGES       = 2;        // only the latest N image-carrying messages are re-sent
+  const MAX_CONTEXT_CHARS = 100000;   // oldest turns are dropped beyond this
+
+  const store = {
+    get(k)    { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+  };
 
   /* ── State ── */
   let history     = [];
   let busy        = false;
-  let attachments = []; // { name, kind:'image'|'text', mimeType, data, size }
+  let ctrl        = null;      // AbortController of the in-flight request
+  let attachments = []; // { name, kind:'image'|'text', mimeType, data, size, truncated? }
+  let warnedTrim  = false;
+
+  let MODEL     = store.get('model') || DEFAULT_ID;
+  let KEY       = store.get('akey');      // access key for non-free models
+  let MODELS    = [];                      // { id, name, provider, free, vision }
+  let PROVIDERS = [];                      // { id, name }
+  let GATED     = false;                   // server has APP_ACCESS_KEY set
+  const pk = { q: '', prov: 'all', free: false, vision: false };
 
   const msgsEl    = document.getElementById('msgs');
   const emptyEl   = document.getElementById('empty');
@@ -111,9 +146,116 @@
       json:'📋', csv:'📊', md:'📝', txt:'📄',
       sh:'⚙️', xml:'📰', yaml:'⚙️', yml:'⚙️',
       sql:'🗄️', c:'🔧', cpp:'🔧', h:'🔧',
-      go:'🐹', rs:'🦀', php:'🐘', rb:'💎',
+      go:'🐹', rs:'🦀', php:'🐘', rb:'💎', svg:'🖼️',
     };
     return map[ext] || '📄';
+  }
+
+  let toastTimer = 0;
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg; el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+  }
+
+  /* ── Models ── */
+  const curModel = () => MODELS.find(m => m.id === MODEL) || { id: MODEL, name: MODEL.replace(/^[^:]+:/, ''), provider: MODEL.split(':')[0], free: MODEL.endsWith(':free'), vision: null };
+  const provName = id => (PROVIDERS.find(p => p.id === id) || {}).name || id;
+  const isLocked = m => !m.free && !KEY;
+
+  function renderModelBtn() {
+    const m = curModel();
+    document.getElementById('model-name').textContent = m.name;
+    document.getElementById('model-badge').textContent = m.free ? 'FREE' : provName(m.provider);
+  }
+
+  async function loadModels() {
+    try {
+      const r = await fetch('/api/models');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      MODELS = d.models || []; PROVIDERS = d.providers || []; GATED = !!d.gated;
+      if (!store.get('model') && d.default) MODEL = d.default;
+      if (d.errors && d.errors.length) toast('โหลดรายชื่อโมเดลไม่ครบ: ' + d.errors[0]);
+    } catch (e) {
+      toast('โหลดรายชื่อโมเดลไม่สำเร็จ — ใช้โมเดลที่เลือกไว้ต่อได้');
+    }
+    renderModelBtn();
+    renderPicker();
+  }
+
+  /* Picker */
+  function openPicker() {
+    document.getElementById('picker').classList.add('open');
+    renderPicker();
+    const q = document.getElementById('pk-q'); q.value = pk.q;
+    if (matchMedia('(hover:hover)').matches) q.focus();   // don't pop the keyboard on phones
+  }
+  function closePicker() { document.getElementById('picker').classList.remove('open'); }
+
+  function renderPicker() {
+    pk.q = document.getElementById('pk-q').value.trim().toLowerCase();
+
+    document.getElementById('pk-chips').innerHTML =
+      `<button class="pk-chip ${pk.prov==='all'?'on':''}" data-prov="all">ทั้งหมด</button>` +
+      PROVIDERS.map(p => `<button class="pk-chip ${pk.prov===p.id?'on':''}" data-prov="${esc(p.id)}">${esc(p.name)}</button>`).join('') +
+      `<button class="pk-chip ${pk.free?'on':''}" data-flag="free">ฟรี</button>` +
+      `<button class="pk-chip ${pk.vision?'on':''}" data-flag="vision">🖼 รับรูป</button>`;
+
+    const rows = MODELS.filter(m =>
+      (pk.prov === 'all' || m.provider === pk.prov) &&
+      (!pk.free || m.free) &&
+      (!pk.vision || m.vision !== false) &&
+      (!pk.q || (m.name + ' ' + m.id).toLowerCase().includes(pk.q)));
+    rows.sort((a, b) => (b.free - a.free) || a.name.localeCompare(b.name));
+
+    const SHOW = 120;
+    document.getElementById('pk-list').innerHTML = rows.slice(0, SHOW).map(m => `
+      <button class="pk-row ${m.id===MODEL?'on':''}" data-id="${esc(m.id)}">
+        <span class="pk-main">
+          <span class="pk-name">${esc(m.name)}</span>
+          <span class="pk-id">${esc(provName(m.provider))} · ${esc(m.id.slice(m.provider.length + 1))}</span>
+        </span>
+        ${m.free ? '<span class="pk-tag">FREE</span>' : ''}
+        ${m.vision ? '<span class="pk-ic" title="รับรูป">🖼</span>' : ''}
+        ${isLocked(m) ? '<span class="pk-ic" title="ต้องใช้รหัส">🔒</span>' : ''}
+      </button>`).join('');
+
+    const note = document.getElementById('pk-note');
+    note.textContent = !MODELS.length ? 'ยังไม่มีรายชื่อโมเดล — ตรวจ API key ใน Vercel'
+      : rows.length > SHOW ? `แสดง ${SHOW} จาก ${rows.length} รายการ — พิมพ์ค้นหาเพื่อกรอง`
+      : !rows.length ? 'ไม่พบโมเดลที่ตรงเงื่อนไข' : '';
+  }
+
+  document.getElementById('pk-chips').addEventListener('click', e => {
+    const b = e.target.closest('.pk-chip'); if (!b) return;
+    if (b.dataset.prov) pk.prov = b.dataset.prov;
+    if (b.dataset.flag) pk[b.dataset.flag] = !pk[b.dataset.flag];
+    renderPicker();
+  });
+  document.getElementById('pk-list').addEventListener('click', e => {
+    const b = e.target.closest('.pk-row'); if (!b) return;
+    const m = MODELS.find(x => x.id === b.dataset.id); if (!m) return;
+    if (isLocked(m)) {
+      if (!GATED) { toast('โมเดลนี้ถูกล็อก — ตั้ง APP_ACCESS_KEY ใน Vercel เพื่อเปิดใช้'); return; }
+      if (!askKey()) return;
+    }
+    MODEL = m.id; store.set('model', MODEL);
+    renderModelBtn(); closePicker();
+    if (m.vision === false && attachments.some(a => a.kind === 'image')) {
+      attachments = attachments.filter(a => a.kind !== 'image'); renderPreviews(); updateSend();
+      toast('โมเดลนี้ไม่รับรูป — เอารูปที่แนบไว้ออกแล้ว');
+    }
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closePicker(); });
+
+  function askKey() {
+    const k = prompt('ใส่รหัสเข้าใช้งาน (APP_ACCESS_KEY) เพื่อใช้โมเดลนี้');
+    if (!k || !k.trim()) return false;
+    KEY = k.trim(); store.set('akey', KEY);
+    renderPicker();
+    return true;
   }
 
   /* ── File reading ── */
@@ -135,21 +277,49 @@
     });
   }
 
+  /* Downscale + re-encode: a 4 MB phone photo becomes ~150 KB, which keeps every
+     request far below the serverless body limit and cuts tokens/latency. */
+  async function shrinkImage(file) {
+    if (file.type === 'image/gif') return { data: await readBase64(file), mime: file.type };
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((res, rej) => {
+        const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url;
+      });
+      const k = Math.min(1, MAX_IMG_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+      if (k === 1 && file.size < 300 * 1024) return { data: await readBase64(file), mime: file.type };
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+      const g = c.getContext('2d');
+      g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);   // transparent PNG → white
+      g.drawImage(img, 0, 0, c.width, c.height);
+      return { data: c.toDataURL('image/jpeg', 0.85), mime: 'image/jpeg' };
+    } finally { URL.revokeObjectURL(url); }
+  }
+
   /* ── File select handler ── */
   async function onFileSelect(e) {
     const files = Array.from(e.target.files);
     e.target.value = '';
 
     for (const file of files) {
-      const isImg = file.type.startsWith('image/');
-      if (isImg) {
-        const data = await readBase64(file);
-        attachments.push({ name: file.name, kind: 'image', mimeType: file.type,
-                           data, size: file.size });
-      } else {
-        const data = await readText(file);
-        attachments.push({ name: file.name, kind: 'text', mimeType: file.type || 'text/plain',
-                           data, size: file.size });
+      if (attachments.length >= MAX_ATTACHMENTS) { toast(`แนบได้สูงสุด ${MAX_ATTACHMENTS} ไฟล์`); break; }
+      try {
+        const isImg = file.type.startsWith('image/') && file.type !== 'image/svg+xml';
+        if (isImg) {
+          if (curModel().vision === false) { toast(`${curModel().name} ไม่รับรูป — ข้าม ${file.name}`); continue; }
+          const { data, mime } = await shrinkImage(file);
+          attachments.push({ name: file.name, kind: 'image', mimeType: mime,
+                             data, size: Math.round(data.length * 0.75) });
+        } else {
+          let data = await readText(file);
+          const truncated = data.length > MAX_FILE_CHARS;
+          if (truncated) data = data.slice(0, MAX_FILE_CHARS);
+          attachments.push({ name: file.name, kind: 'text', mimeType: file.type || 'text/plain',
+                             data, size: file.size, truncated });
+        }
+      } catch {
+        toast(`อ่านไฟล์ ${file.name} ไม่ได้`);
       }
     }
     renderPreviews();
@@ -175,14 +345,13 @@
             <button class="pv-rm" onclick="removeAtt(${i})" title="ลบ">×</button>
           </div>`;
       } else {
-        const ext = (a.name.split('.').pop() || 'FILE').toUpperCase().slice(0,6);
         const icon = fileIcon(a.name);
         return `
           <div class="pv-chip file">
             <span style="font-size:16px;flex-shrink:0">${icon}</span>
             <div style="display:flex;flex-direction:column;overflow:hidden;gap:1px">
               <span class="pv-name">${esc(a.name)}</span>
-              <span style="font-size:10px;color:var(--muted)">${fmtSize(a.size)}</span>
+              <span style="font-size:10px;color:var(--muted)">${fmtSize(a.size)}${a.truncated ? ' · ตัดที่ ' + (MAX_FILE_CHARS/1000) + 'K ตัวอักษร' : ''}</span>
             </div>
             <button class="pv-rm" onclick="removeAtt(${i})" title="ลบ">×</button>
           </div>`;
@@ -196,9 +365,13 @@
     updateSend();
   }
 
+  /* Send button doubles as Stop while a reply is streaming */
   function updateSend() {
-    sendBtn.disabled = busy || (!tiEl.value.trim() && !attachments.length);
+    sendBtn.classList.toggle('stop', busy);
+    sendBtn.title = busy ? 'หยุด' : 'ส่ง';
+    sendBtn.disabled = !busy && !tiEl.value.trim() && !attachments.length;
   }
+  function onSendClick() { busy ? ctrl && ctrl.abort() : send(); }
 
   /* ── Input helpers ── */
   function onInput(el) {
@@ -210,19 +383,23 @@
   function onKey(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (!sendBtn.disabled) send();
+      if (!busy && !sendBtn.disabled) send();
     }
   }
 
-  /* ── Markdown mini-parser ── */
+  /* ── Markdown mini-parser ──
+     Everything that is not a code span is HTML-escaped BEFORE markdown is applied,
+     so model output (or an attached file) can never inject markup. */
   function md(raw) {
+    if ((raw.match(/```/g) || []).length % 2) raw += '\n```';   // close a fence still streaming in
     const blocks = [];
+    const keep = html => `\x00${blocks.push(html) - 1}\x00`;
     let s = raw.replace(/```[\s\S]*?```/g, m => {
-      const code = m.replace(/```\w*\n?/, '').replace(/```$/, '').trim();
-      blocks.push(`<pre><code>${esc(code)}</code></pre>`);
-      return `\x00${blocks.length - 1}\x00`;
+      const code = m.replace(/```[^\n]*\n?/, '').replace(/```$/, '').replace(/\n$/, '');
+      return keep(`<pre><code>${esc(code)}</code></pre>`);
     });
-    s = s.replace(/`([^`]+)`/g, (_, c) => `<code>${esc(c)}</code>`);
+    s = s.replace(/`([^`\n]+)`/g, (_, c) => keep(`<code>${esc(c)}</code>`));
+    s = esc(s);
     s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     s = s.replace(/^## (.+)$/gm,  '<h2>$1</h2>');
     s = s.replace(/^# (.+)$/gm,   '<h1>$1</h1>');
@@ -230,15 +407,16 @@
     s = s.replace(/\*\*(.+?)\*\*/g,     '<strong>$1</strong>');
     s = s.replace(/\*(.+?)\*/g,         '<em>$1</em>');
     s = s.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
-    s = s.replace(/^\d+\. (.+)$/gm,  '<li>$1</li>');
+    s = s.replace(/^\d+\. (.+)$/gm,  '<oli>$1</oli>');
+    s = s.replace(/(?:<li>.*<\/li>\n?)+/g,   m => `<ul>${m.trim()}</ul>`);
+    s = s.replace(/(?:<oli>.*<\/oli>\n?)+/g, m => `<ol>${m.trim().replace(/oli>/g, 'li>')}</ol>`);
     s = s.split(/\n{2,}/).map(p => {
       p = p.trim();
       if (!p) return '';
-      if (/^<(h\d|ul|ol|pre|li)/.test(p)) return p;
+      if (/^\x00\d+\x00$/.test(p) || /^<(h\d|ul|ol|pre)/.test(p)) return p;
       return `<p>${p.replace(/\n/g, '<br>')}</p>`;
     }).join('');
-    s = s.replace(/\x00(\d+)\x00/g, (_, i) => blocks[+i]);
-    return s;
+    return s.replace(/\x00(\d+)\x00/g, (_, i) => blocks[+i]);
   }
 
   /* ── Time ── */
@@ -281,7 +459,7 @@
       }
       html += '</div>';
     }
-    if (text) html += md(esc(text));
+    if (text) html += md(text);
     return html;
   }
 
@@ -315,12 +493,57 @@
 
   /* ── Clear chat ── */
   function clearChat() {
-    history = []; attachments = [];
+    if (ctrl) ctrl.abort();
+    history = []; attachments = []; warnedTrim = false;
     renderPreviews();
     msgsEl.innerHTML = '';
     msgsEl.appendChild(emptyEl);
     emptyEl.style.display = '';
     updateSend();
+  }
+
+  /* ── Build what is actually sent to the API ──
+     1. Only the latest KEEP_IMAGES image-carrying messages keep their pixels.
+     2. Images are dropped entirely if the selected model can't see.
+     3. Oldest turns are dropped once the text budget is exceeded.
+     `history` itself is never modified. */
+  function payloadMessages() {
+    const canSee = curModel().vision !== false;
+    let keep = KEEP_IMAGES;
+    const out = [];
+    for (let i = history.length - 1; i >= 0; i--) {
+      let m = history[i];
+      if (Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')) {
+        if (canSee && keep > 0) keep--;
+        else m = { ...m, content: m.content.map(p =>
+          p.type === 'image_url' ? { type: 'text', text: '[image omitted]' } : p) };
+      }
+      out.unshift(m);
+    }
+    const size = m => Array.isArray(m.content)
+      ? m.content.reduce((n, p) => n + (p.type === 'text' ? p.text.length : 1500), 0)
+      : m.content.length;
+    let total = out.reduce((n, m) => n + size(m), 0);
+    let trimmed = false;
+    while (out.length > 1 && (total > MAX_CONTEXT_CHARS || out[0].role !== 'user')) {
+      total -= size(out.shift()); trimmed = true;
+    }
+    if (trimmed && !warnedTrim) { warnedTrim = true; toast('บทสนทนายาว — ตัดข้อความเก่าสุดออกจากบริบทที่ส่งให้โมเดล'); }
+    return out;
+  }
+
+  async function callApi(signal) {
+    const go = () => fetch(ENDPOINT, {
+      method: 'POST', signal,
+      headers: { 'Content-Type': 'application/json', ...(KEY ? { 'x-access-key': KEY } : {}) },
+      body: JSON.stringify({ model: MODEL, messages: payloadMessages() })
+    });
+    let res = await go();
+    if (res.status === 401) {
+      const j = await res.clone().json().catch(() => ({}));
+      if (j?.error?.code === 'access_required' && askKey()) res = await go();
+    }
+    return res;
   }
 
   /* ── Send ── */
@@ -345,7 +568,7 @@
       // Text files → prepend as text block
       const fileTexts = atts
         .filter(a => a.kind === 'text')
-        .map(a => `📄 **${a.name}**\n\`\`\`\n${a.data.slice(0, 8000)}\n\`\`\``)
+        .map(a => `📄 **${a.name}**\n\`\`\`\n${a.data}\n\`\`\`${a.truncated ? '\n(ไฟล์ถูกตัดที่ ' + MAX_FILE_CHARS + ' ตัวอักษรแรก)' : ''}`)
         .join('\n\n');
       const combined = [fileTexts, text].filter(Boolean).join('\n\n');
       if (combined) parts.push({ type: 'text', text: combined });
@@ -363,18 +586,16 @@
     /* Reset input */
     tiEl.value = ''; tiEl.style.height = 'auto';
     attachments = []; renderPreviews();
-    busy = true; sendBtn.disabled = true;
+    busy = true; ctrl = new AbortController(); updateSend();
 
     /* AI typing */
     const aiEl = appendMsg('assistant', '', true);
     let full = '';
+    let raf = 0;
+    const paint = () => { raf = 0; fillBubble(aiEl, md(full)); };   // at most once per frame
 
     try {
-      const res = await fetch(ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: MODEL, messages: history })
-      });
+      const res = await callApi(ctrl.signal);
 
       if (!res.ok) {
         const e = await res.json().catch(() => ({}));
@@ -383,35 +604,49 @@
 
       const reader  = res.body.getReader();
       const decoder = new TextDecoder();
+      let buf = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value);
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const raw = line.slice(6).trim();
-          if (raw === '[DONE]') continue;
-          try {
-            const delta = JSON.parse(raw)?.choices?.[0]?.delta?.content;
-            if (delta) { full += delta; fillBubble(aiEl, md(full)); }
-          } catch {}
+        buf += decoder.decode(value, { stream: true });   // keeps split Thai bytes intact
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {           // only parse complete lines
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith('data:')) continue;
+          const raw = line.slice(5).trim();
+          if (!raw || raw === '[DONE]') continue;
+          let j; try { j = JSON.parse(raw); } catch { continue; }
+          if (j.error) throw new Error(j.error.message || 'Upstream error');
+          const delta = j.choices?.[0]?.delta?.content;
+          if (delta) { full += delta; if (!raf) raf = requestAnimationFrame(paint); }
         }
       }
 
+      if (raf) cancelAnimationFrame(raf);
+      if (!full) throw new Error('โมเดลไม่ตอบกลับ — อาจติดโควต้า ลองเลือกโมเดลอื่น');
       fillBubble(aiEl, md(full), true);
       history.push({ role: 'assistant', content: full });
 
     } catch (err) {
-      fillBubble(aiEl, `<div class="err-bubble">⚠ ${esc(err.message)}</div>`, true);
-      history.pop();
+      if (raf) cancelAnimationFrame(raf);
+      if (err.name === 'AbortError') {
+        if (full) { fillBubble(aiEl, md(full), true); history.push({ role: 'assistant', content: full }); }
+        else { fillBubble(aiEl, '<div class="err-bubble">หยุดการตอบแล้ว</div>', true); history.pop(); }
+      } else {
+        fillBubble(aiEl, `<div class="err-bubble">⚠ ${esc(err.message)}</div>`, true);
+        history.pop();
+      }
     }
 
-    busy = false;
+    busy = false; ctrl = null;
     updateSend();
     tiEl.focus();
   }
 
+  renderModelBtn();
+  loadModels();
   tiEl.focus();
 </script>
 </body>
